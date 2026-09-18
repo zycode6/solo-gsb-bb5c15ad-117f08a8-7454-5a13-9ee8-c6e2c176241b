@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_serializer, model_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 
 from .agenda import AgendaError, AgendaFragment, build_agenda
 from .alarms import AlarmError, Reminder, expand_alarms
@@ -23,6 +23,7 @@ from .availability import (
     busy_intervals,
     common_free_slots,
 )
+from .compressor import CompressionError, compress_instances
 from .conflicts import ConflictSegment, ConflictsError, Participant, find_conflicts
 from .diff import CalendarDiff, diff_calendars
 from .expander import ExpansionError, Instance, expand_calendar
@@ -32,13 +33,14 @@ UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.7.0",
+    version="1.8.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
     "into concrete UTC instances, intersect named calendars with "
     "local working hours to find common free time, find high-concurrency "
     "segments across named calendars, expand VALARM reminders, report "
-    "per-instance ATTENDEE participation status inside a query window, and "
-    "validate raw iCalendar text structurally.",
+    "per-instance ATTENDEE participation status inside a query window, "
+    "compress a set of equal-length UTC instances into the shortest "
+    "recurrence ICS, and validate raw iCalendar text structurally.",
 )
 
 
@@ -504,6 +506,48 @@ class ValidateResponse(BaseModel):
     issues: list[IssueOut]
 
 
+# ---------------------------------------------------------------------------
+# POST /compress-schedule
+# ---------------------------------------------------------------------------
+
+
+class ScheduleInstance(BaseModel):
+    start: dt.datetime = Field(
+        ..., description="Instance start (ISO 8601, must be UTC-aware)"
+    )
+    end: dt.datetime = Field(
+        ..., description="Instance end (ISO 8601, must be UTC-aware and > start)"
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def _must_be_utc(cls, value: dt.datetime) -> dt.datetime:
+        if value.tzinfo is None or value.utcoffset() != dt.timedelta(0):
+            raise ValueError("instance times must be UTC (use the 'Z' suffix)")
+        return value
+
+
+class CompressScheduleRequest(BaseModel):
+    uid: str = Field(..., min_length=1, description="UID of the generated VEVENT")
+    instances: list[ScheduleInstance] = Field(
+        ...,
+        min_length=1,
+        description="Equal-length, non-overlapping instances with unique starts",
+    )
+
+
+class CompressScheduleResponse(BaseModel):
+    strategy: str = Field(
+        ...,
+        description="Winning representation: 'RRULE:FREQ=<DAILY|WEEKLY>;"
+        "INTERVAL=<1..4>' or 'RDATE' for the DTSTART+RDATE fallback",
+    )
+    exception_count: int = Field(
+        ..., description="Number of EXDATE plus RDATE values in the chosen ICS"
+    )
+    ics: str = Field(..., description="Complete, /expand-parsable iCalendar text")
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -706,4 +750,18 @@ def conflicts(request: ConflictsRequest) -> ConflictsResponse:
             )
             for segment in segments
         ],
+    )
+
+
+@app.post("/compress-schedule", response_model=CompressScheduleResponse)
+def compress_schedule(request: CompressScheduleRequest) -> CompressScheduleResponse:
+    instances = [(_to_utc(item.start), _to_utc(item.end)) for item in request.instances]
+    try:
+        result = compress_instances(request.uid, instances)
+    except CompressionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return CompressScheduleResponse(
+        strategy=result.strategy,
+        exception_count=result.exception_count,
+        ics=result.ics,
     )
