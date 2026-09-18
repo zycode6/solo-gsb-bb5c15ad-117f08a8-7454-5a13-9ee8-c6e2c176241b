@@ -9,6 +9,11 @@ local working hours.
 - Merges overrides by `UID` + `RECURRENCE-ID`: an override can **reschedule**
   an instance (judged against the window by its *actual* new start/end; the
   original slot is never kept) or **cancel** it via `STATUS:CANCELLED`
+- `/compress-schedule` is the inverse of `/expand`: it compresses a flat
+  list of equal-length, non-overlapping UTC instances into the smallest
+  `RRULE`/`RDATE`/`EXDATE` calendar (DAILY/WEEKLY, `INTERVAL` 1–4), with a
+  pure `DTSTART`+`RDATE` fallback, and the result always round-trips through
+  `/expand`
 - Interprets `TZID` as IANA timezones with correct DST handling
 - `/agenda` renders the same expanded instances as a **local agenda** for an
   IANA display timezone: timed events crossing local midnight are split into
@@ -109,6 +114,79 @@ the new time (the original slot is gone):
   ]
 }
 ```
+
+### `POST /compress-schedule`
+
+The inverse of `/expand`: given a flat list of concrete equal-length UTC
+instances sharing a `UID`, it returns the **smallest** complete iCalendar
+document that reproduces exactly those instances. Request body:
+
+| Field       | Type   | Description                                                       |
+| ----------- | ------ | ----------------------------------------------------------------- |
+| `uid`       | string | Non-empty `UID` written on the compressed `VEVENT`                |
+| `instances` | array  | Non-empty list of `{start, end}` (ISO 8601, converted to UTC)     |
+
+Every instance must have a later end than its start, all instances must have
+the **same duration**, starts must be **unique**, and the half-open
+`[start, end)` intervals must not **overlap** (back-to-back intervals are
+fine); input order does not matter. Any violation returns `422`.
+
+Compression semantics:
+
+- The earliest start becomes `DTSTART`; the latest start is used as `UNTIL`.
+- The search tries every combination of `FREQ=DAILY`/`FREQ=WEEKLY` with
+  `INTERVAL` 1–4. For each grid, missing grid points become `EXDATE` entries
+  and instances lying off the grid become `RDATE` entries.
+- A guaranteed **fallback** with no `RRULE` at all is always considered:
+  `DTSTART` plus one `RDATE` per remaining instance.
+- Every candidate is rendered as a complete, parseable `VCALENDAR` (with
+  RFC 5545 line folding) and verified through the live expansion engine;
+  candidates that fail the round trip are discarded.
+- The winner has the **fewest UTF-8 bytes**. Ties are broken by fewer
+  exceptions (`EXDATE` entries), then a candidate with an `RRULE` over the
+  `RDATE` fallback, then `DAILY` over `WEEKLY`, then the smaller `INTERVAL`.
+
+The response is:
+
+| Field             | Type    | Description                                                  |
+| ----------------- | ------- | ----------------------------------------------------------- |
+| `strategy`        | string  | `DTSTART+RDATE` for the fallback, otherwise the full `RRULE` |
+| `exception_count` | integer | Number of `EXDATE` entries in the chosen calendar            |
+| `ics`             | string  | The complete `VCALENDAR` text                                |
+
+Feeding `ics` back to `/expand` (with a window covering all instances)
+reproduces the exact same set of UTC starts and ends.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/compress-schedule \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "uid": "standup",
+    "instances": [
+      {"start": "2026-01-05T09:00:00Z", "end": "2026-01-05T09:15:00Z"},
+      {"start": "2026-01-06T09:00:00Z", "end": "2026-01-06T09:15:00Z"},
+      {"start": "2026-01-07T09:00:00Z", "end": "2026-01-07T09:15:00Z"},
+      {"start": "2026-01-08T09:00:00Z", "end": "2026-01-08T09:15:00Z"},
+      {"start": "2026-01-09T09:00:00Z", "end": "2026-01-09T09:15:00Z"}
+    ]
+  }'
+```
+
+Five consecutive weekdays compress to a single daily rule:
+
+```json
+{
+  "strategy": "RRULE:FREQ=DAILY;INTERVAL=1;UNTIL=20260109T090000Z",
+  "exception_count": 0,
+  "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//compress-schedule-api//EN\r\nBEGIN:VEVENT\r\nUID:standup\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T091500Z\r\nRRULE:FREQ=DAILY;INTERVAL=1;UNTIL=20260109T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+}
+```
+
+A daily series with a single missing day keeps the rule and records the gap
+as `EXDATE`; an irregular set of a few dates is smaller as plain `RDATE`s,
+in which case `strategy` is `DTSTART+RDATE` and `exception_count` is `0`.
 
 ### `POST /agenda`
 
@@ -898,6 +976,13 @@ calendar content. Unparsable text and malformed events are reported as
 `event_index`/`uid`). The only `422` from `/validate` is a malformed
 request body (e.g. a missing `ics` field).
 
+`/compress-schedule` returns `422` for an empty instance list (also enforced
+by the request schema), a missing or blank `uid`, malformed timestamps, an
+instance whose `end` is not later than its `start`, instances of unequal
+duration, duplicate starts, or overlapping intervals. Naive timestamps are
+assumed UTC and offset-bearing ones are converted to UTC, exactly as on the
+other endpoints.
+
 ## Semantics and limitations
 
 - **Window overlap**: an instance is included when
@@ -1042,11 +1127,13 @@ uvicorn app.main:app --reload       # run locally on port 8000
 ## Project layout
 
 ```
-app/main.py          FastAPI app: POST /expand, POST /agenda, POST /alarms,
+app/main.py          FastAPI app: POST /expand, POST /compress-schedule,
+                     POST /agenda, POST /alarms,
                      POST /attendance, POST /calendar-diff,
                      POST /availability, POST /conflicts, POST /validate,
                      GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
+app/compressor.py    UTC-instance compression into smallest RRULE/RDATE/EXDATE ICS
 app/agenda.py        local-day agenda fragments, midnight splitting, DATE handling
 app/validation.py    structural VEVENT checks, stable issue codes, sorting
 app/alarms.py        VALARM parsing, REPEAT/DURATION fan-out, window filtering

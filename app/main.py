@@ -23,6 +23,7 @@ from .availability import (
     busy_intervals,
     common_free_slots,
 )
+from .compressor import CompressionError, compress_schedule
 from .conflicts import ConflictSegment, ConflictsError, Participant, find_conflicts
 from .diff import CalendarDiff, diff_calendars
 from .expander import ExpansionError, Instance, expand_calendar
@@ -32,13 +33,14 @@ UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.7.0",
+    version="1.8.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
     "into concrete UTC instances, intersect named calendars with "
     "local working hours to find common free time, find high-concurrency "
     "segments across named calendars, expand VALARM reminders, report "
-    "per-instance ATTENDEE participation status inside a query window, and "
-    "validate raw iCalendar text structurally.",
+    "per-instance ATTENDEE participation status inside a query window, "
+    "compress a flat set of UTC instances into the smallest RRULE/RDATE/"
+    "EXDATE calendar, and validate raw iCalendar text structurally.",
 )
 
 
@@ -86,6 +88,45 @@ class ExpandResponse(BaseModel):
     @field_serializer("window_start", "window_end")
     def _serialize_window(self, value: dt.datetime) -> str:
         return _iso_z(value)
+
+
+# ---------------------------------------------------------------------------
+# POST /compress-schedule
+# ---------------------------------------------------------------------------
+
+
+class CompressInstance(BaseModel):
+    """One concrete UTC occurrence of the series to compress."""
+
+    model_config = {"extra": "forbid"}
+
+    start: dt.datetime = Field(
+        ..., description="Instance start (ISO 8601, converted to UTC)"
+    )
+    end: dt.datetime = Field(
+        ..., description="Instance end (ISO 8601, converted to UTC)"
+    )
+
+
+class CompressScheduleRequest(BaseModel):
+    uid: str = Field(..., description="UID for the compressed VEVENT")
+    instances: list[CompressInstance] = Field(
+        ..., min_length=1, description="Non-empty list of equal-length UTC instances"
+    )
+
+
+class CompressScheduleResponse(BaseModel):
+    strategy: str = Field(
+        ...,
+        description="Winner's recurrence description: 'DTSTART+RDATE' for the "
+        "fallback, otherwise the full RRULE property value "
+        "(e.g. 'RRULE:FREQ=DAILY;INTERVAL=1;UNTIL=20260109T090000Z')",
+    )
+    exception_count: int = Field(
+        ..., description="Number of EXDATE entries in the chosen calendar"
+    )
+    ics: str = Field(..., description="Complete VCALENDAR text reproducing the "
+                                      "instances when fed back through /expand")
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +578,24 @@ def expand(request: ExpandRequest) -> ExpandResponse:
         window_end=window_end,
         count=len(instances),
         instances=[_instance_out(i) for i in instances],
+    )
+
+
+@app.post("/compress-schedule", response_model=CompressScheduleResponse)
+def compress_schedule_endpoint(
+    request: CompressScheduleRequest,
+) -> CompressScheduleResponse:
+    instances = [
+        (_to_utc(item.start), _to_utc(item.end)) for item in request.instances
+    ]
+    try:
+        winner = compress_schedule(request.uid, instances)
+    except CompressionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return CompressScheduleResponse(
+        strategy=winner.strategy,
+        exception_count=winner.exception_count,
+        ics=winner.ics,
     )
 
 
